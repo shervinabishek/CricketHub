@@ -11,12 +11,30 @@ import {
 import { useFocusEffect } from '@react-navigation/native';
 import { getDatabase } from '../database/db';
 
+const describeDismissal = (row) => {
+  if (!row) return 'Not out';
+  const f = row.fielder_name;
+  const b = row.bowler_name;
+  switch (row.wicket_type) {
+    case 'bowled': return `b ${b}`;
+    case 'caught': return `c ${f || 'fielder'} b ${b}`;
+    case 'lbw': return `lbw b ${b}`;
+    case 'stumped': return `st ${f || 'keeper'} b ${b}`;
+    case 'run_out': return `run out (${f || 'fielder'})`;
+    case 'hit_wicket': return `hit wicket b ${b}`;
+    case 'retired_out': return 'retired out';
+    case 'obstructing_the_field': return 'obstructing the field';
+    default: return String(row.wicket_type).replace(/_/g, ' ');
+  }
+};
+
 export default function FullScorecardScreen({ route }) {
   const { matchId } = route.params;
 
   const [inningsData, setInningsData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [matchInfo, setMatchInfo] = useState(null);
 
   const loadScorecard = useCallback(async () => {
     try {
@@ -104,17 +122,22 @@ export default function FullScorecardScreen({ route }) {
         // Get dismissal information for every dismissed player.
         for (const player of battingMap.values()) {
           const dismissalRow = await db.getFirstAsync(
-            `SELECT wicket_type
-             FROM ball_events
-             WHERE innings_id = ?
-               AND is_wicket = 1
-               AND dismissed_player_id = ?
-             ORDER BY delivery_number DESC
+            `SELECT be.wicket_type,
+                    bw.player_name AS bowler_name,
+                    f.player_name AS fielder_name
+             FROM ball_events be
+             JOIN players bw ON bw.player_id = be.bowler_id
+             LEFT JOIN players f ON f.player_id = be.fielder_id
+             WHERE be.innings_id = ?
+               AND be.is_wicket = 1
+               AND be.dismissed_player_id = ?
+             ORDER BY be.delivery_number DESC
              LIMIT 1`,
             [innings.innings_id, player.player_id]
           );
 
           player.dismissal = dismissalRow?.wicket_type || null;
+          player.dismissalText = describeDismissal(dismissalRow);
         }
 
         const bowlingRows = await db.getAllAsync(
@@ -125,7 +148,7 @@ export default function FullScorecardScreen({ route }) {
              COALESCE(SUM(
                CASE
                  WHEN be.extras_type IN ('bye', 'leg_bye')
-                 THEN be.batter_runs + be.extras_runs
+                 THEN 0
                  ELSE be.total_runs
                END
              ), 0) AS runs_conceded,
@@ -151,13 +174,42 @@ export default function FullScorecardScreen({ route }) {
           [innings.innings_id]
         );
 
+        const extrasRow = await db.getFirstAsync(
+          `SELECT
+             COALESCE(SUM(CASE WHEN extras_type = 'wide' THEN extras_runs ELSE 0 END), 0) AS wides,
+             COALESCE(SUM(CASE WHEN extras_type = 'no_ball' THEN extras_runs ELSE 0 END), 0) AS no_balls,
+             COALESCE(SUM(CASE WHEN extras_type = 'bye' THEN extras_runs ELSE 0 END), 0) AS byes,
+             COALESCE(SUM(CASE WHEN extras_type = 'leg_bye' THEN extras_runs ELSE 0 END), 0) AS leg_byes
+           FROM ball_events WHERE innings_id = ?`,
+          [innings.innings_id]
+        );
+
+        const fallRows = await db.getAllAsync(
+          `SELECT p.player_name, be.delivery_number
+           FROM ball_events be
+           JOIN players p ON p.player_id = be.dismissed_player_id
+           WHERE be.innings_id = ? AND be.is_wicket = 1
+           ORDER BY be.delivery_number ASC`,
+          [innings.innings_id]
+        );
+
         completeData.push({
           ...innings,
+          extras: extrasRow,
+          fall: fallRows,
           batting: Array.from(battingMap.values()),
           bowling: bowlingRows,
         });
       }
 
+      const matchRow = await db.getFirstAsync(
+        `SELECT m.status, w.team_name AS winner_name
+         FROM matches m
+         LEFT JOIN teams w ON w.team_id = m.winner_team_id
+         WHERE m.match_id = ?`,
+        [matchId]
+      );
+      setMatchInfo(matchRow);
       setInningsData(completeData);
     } catch (error) {
       console.log('Full scorecard error:', error);
@@ -228,6 +280,7 @@ export default function FullScorecardScreen({ route }) {
           <Text style={styles.headerCell}>B</Text>
           <Text style={styles.headerCell}>4s</Text>
           <Text style={styles.headerCell}>6s</Text>
+          <Text style={styles.headerCell}>SR</Text>
         </View>
 
         {innings.batting.length === 0 ? (
@@ -240,7 +293,7 @@ export default function FullScorecardScreen({ route }) {
                   {player.player_name}
                 </Text>
                 <Text style={styles.dismissalText}>
-                  {formatDismissal(player.dismissal)}
+                  {player.dismissalText}
                 </Text>
               </View>
 
@@ -248,8 +301,33 @@ export default function FullScorecardScreen({ route }) {
               <Text style={styles.cell}>{player.balls}</Text>
               <Text style={styles.cell}>{player.fours}</Text>
               <Text style={styles.cell}>{player.sixes}</Text>
+              <Text style={styles.cell}>
+                {Number(player.balls) > 0
+                  ? ((Number(player.runs) / Number(player.balls)) * 100).toFixed(1)
+                  : '0.0'}
+              </Text>
             </View>
           ))
+        )}
+
+        {(() => {
+          const e = innings.extras || {};
+          const total =
+            Number(e.wides) + Number(e.no_balls) + Number(e.byes) + Number(e.leg_byes);
+          return (
+            <Text style={styles.dismissalText}>
+              Extras: {total} (b {e.byes}, lb {e.leg_byes}, w {e.wides}, nb {e.no_balls})
+              {'\n'}Total: {innings.total_runs}/{innings.wickets} ({formatOvers(totalBalls)} ov)
+            </Text>
+          );
+        })()}
+
+        {innings.fall && innings.fall.length > 0 && (
+          <Text style={styles.dismissalText}>
+            {'\n'}Fall of wickets: {innings.fall
+              .map((w, i) => `${i + 1}. ${w.player_name}`)
+              .join(', ')}
+          </Text>
         )}
 
         <Text style={styles.sectionTitle}>Bowling Scorecard</Text>
@@ -261,6 +339,7 @@ export default function FullScorecardScreen({ route }) {
           <Text style={styles.headerCell}>O</Text>
           <Text style={styles.headerCell}>R</Text>
           <Text style={styles.headerCell}>W</Text>
+          <Text style={styles.headerCell}>ECO</Text>
         </View>
 
         {innings.bowling.length === 0 ? (
@@ -282,6 +361,11 @@ export default function FullScorecardScreen({ route }) {
               </Text>
               <Text style={styles.cell}>
                 {player.wickets}
+              </Text>
+              <Text style={styles.cell}>
+                {Number(player.legal_balls) > 0
+                  ? (Number(player.runs_conceded) / (Number(player.legal_balls) / 6)).toFixed(2)
+                  : '0.00'}
               </Text>
             </View>
           ))
@@ -314,6 +398,14 @@ export default function FullScorecardScreen({ route }) {
       }
     >
       <Text style={styles.pageTitle}>Full Match Scorecard</Text>
+
+      {matchInfo?.status === 'Completed' && (
+        <Text style={styles.teamName}>
+          {matchInfo.winner_name
+            ? `Result: ${matchInfo.winner_name} won`
+            : 'Result: Match tied'}
+        </Text>
+      )}
 
       {inningsData.length === 0 ? (
         <Text style={styles.emptyText}>
